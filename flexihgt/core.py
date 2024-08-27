@@ -85,7 +85,7 @@ class HGTDetect:
         print(f"{'Search Method':<20} | {search}")
         print("-----------------")
 
-    def load_fasta(self, name, genes, geneSeq):
+    def load_fasta(self, name: str , genes: List[str], geneSeq: Dict[str, str]) -> List[str]:
         """
         Loads the fasta file into a dictionary
         """
@@ -97,7 +97,7 @@ class HGTDetect:
                 genes.append(gene)
         return genes
 
-    def run_search(self, name):
+    def run_search(self, name: str) -> None:
         """
         Runs the homology search
         """
@@ -118,7 +118,7 @@ class HGTDetect:
             print("Error: Search method not recognized")
             sys.exit()  
 
-    def load_diamond_results(self, combined_file, gene):
+    def load_diamond_results(self, combined_file: str , gene: str) -> pd.DataFrame:
         """
         Load the diamond results file into a dataframe and filter for the gene of interest
         """
