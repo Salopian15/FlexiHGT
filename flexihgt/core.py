@@ -12,7 +12,7 @@ class HGTDetect:
     Class to detect HGT events in protein sequences
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         # Initialize the class
         # Set up the NCBI Taxonomy database
         self.ncbi = NCBITaxa()
@@ -22,16 +22,16 @@ class HGTDetect:
         self.tax_level = "family"
         self.search = "diamond"
         self.query_tax = None
-        self.genes = list()
-        self.geneSeq = dict()
-        self.HGT = list()
+        self.genes: List[str] = []
+        self.geneSeq: Dict[str, str] = {}
+        self.HGT: List[List[Any]] = []
         self.set_params(self.parse_args())
         #self.ncbi.update_taxonomy_database()
         #self.taxdb = "~/.etetoolkit/taxa.sqlite"
         self.taxdb = "~/.etetoolkit/taxa.sqlite"
         self.dmnd_dbpath = None
 
-    def parse_args(self):
+    def parse_args(self) -> Any:
         """
         Parses command line arguments
         """
@@ -44,10 +44,10 @@ class HGTDetect:
         parser.add_argument("-s", "--search", type=str, default="diamond", choices=["diamond", "mmseqs"], help="Search methods, diamond & mmseqs use local database for search, default is diamond.")
         parser.add_argument("-u", "--update", action="store_true", help="Update the NCBI taxonomy database")
         parser.add_argument("-q", "--query_tax", type=int, help="Taxid associated with the query sequence")
-        parser.add_argument("-db", "--database", help="Path to the search database (e.g., Diamond or MMseqs database)")
-        return parser.parse_args()        
+        parser.add_argument("-db", "--database", help="Path to the search database, link to database file (e.g., Diamond or MMseqs database)", required=True)
+        return parser.parse_args()
 
-    def set_params(self, args):
+    def set_params(self, args: Any) -> None:
         """
         Set the parameters
         """
@@ -65,13 +65,10 @@ class HGTDetect:
         tax_level = args.tax_level.lower()
         search = args.search.lower()
         update = args.update
-        qtaxid = args.query_tax
-
         if update:
             self.ncbi.update_taxonomy_database()
-        
         warnings.simplefilter('ignore', BiopythonWarning)
-        if not os.path.exists(self.dmnd_dbpath):
+        if self.dmnd_dbpath is None or not os.path.exists(self.dmnd_dbpath):
             print(f'Error: database not found at {self.dmnd_dbpath}')
             sys.exit()
         # Print the table header
@@ -111,7 +108,7 @@ class HGTDetect:
             myCmd = str(myCmd)
             os.system(myCmd)
         elif self.search == "mmseqs":
-            myCmd = f'mmseqs easy-search {name} {self.mmseqs_dbpath} {outf} --max-seqs 250 --format-output "query,target,evalue,bits,alnlen,pident,taxid'
+            myCmd = f'mmseqs easy-search {name} {self.dmnd_dbpath} {outf} --max-seqs 250 --format-output "query,target,evalue,bits,alnlen,pident,taxid'
             myCmd = str(myCmd)
             os.system(myCmd)
         else:
@@ -130,7 +127,7 @@ class HGTDetect:
             sys.exit()
         return gene_results
 
-    def get_refTax(self, qtaxid, tax_level):
+    def get_refTax(self, qtaxid: int, tax_level: str) -> int:
         """
         Get the taxonomy of the host organism (the organism of the input sequences)
         """
@@ -179,7 +176,14 @@ class HGTDetect:
         taxid = filtered_results[6].str.split(';').str[-1].values[0]
         return taxid
 
-    def hgt_calc(self, gene, max_outgroup_bitscore, max_recipient_organism_bitscore, outgroup_species_number, recipient_species_number, HGT, HGTIndex, out_pct, tax_level, names, taxonomy_alignments, bitscore_parameter, donor_taxonomy):
+    def hgt_calc(
+        self, gene: str, max_outgroup_bitscore: float,
+        max_recipient_organism_bitscore: float,outgroup_species_number: int, 
+        recipient_species_number: int,HGT: List[List[Any]],
+        HGTIndex: float, out_pct: float, tax_level: str, names: Dict[str, str],
+        taxonomy_alignments: Dict[str, Dict[str, str]], bitscore_parameter: float,
+        donor_taxonomy: str
+    ) -> List[List[Any]]:
         """
         Calculates the likelihood of a HGT event
         """
@@ -246,7 +250,7 @@ class HGTDetect:
             #    return None
             
             if gene_taxlevel is None:
-                print(f"Warning: Tax level {args.tax_level} not found for query taxid {args.query_tax}. Skipping gene {gene}.")
+                print(f"Warning: Tax level {args.tax_level} not found for query taxid {args.query_tax}. Skipping gene {gene}.", flush=True)
                 return None
             recipient_accession = set()
             recipient_species = set()
@@ -255,7 +259,7 @@ class HGTDetect:
             #evalue_dict = {}
             for accession, taxid in accession_to_taxid.items():
                 if taxid not in taxonomy_alignments:
-                    print(f"Warning: Taxid {taxid} not found in taxonomy alignments. Skipping this accession.")
+                    print(f"Warning: Taxid {taxid} not found in taxonomy alignments. Skipping this accession.", flush=True)
                     continue
                 taxonomy_alignment = taxonomy_alignments[taxid]
                 if args.tax_level in taxonomy_alignment and taxonomy_alignment[args.tax_level] == gene_taxlevel:
@@ -300,10 +304,10 @@ class HGTDetect:
                 print("Result for ", gene, "processed", flush= True)
                 return hgt_result[0] if hgt_result else None
             else:
-                print(f"Skipping HGT calculation for gene {gene} due to missing bitscore data")
+                print(f"Skipping HGT calculation for gene {gene} due to missing bitscore data", flush=True)
                 return None
         except Exception as e:
-            print(f'Error in process_gene for gene {gene}: {e.__class__.__name__}, Message: {e}')
+            print(f'Error in process_gene for gene {gene}: {e.__class__.__name__}, Message: {e}', flush=True)
             return None
 
     @lru_cache(maxsize=None)
