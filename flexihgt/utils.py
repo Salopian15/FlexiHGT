@@ -67,3 +67,45 @@ def check_all():
         if not check_ete3db():
             print('ete3 database is missing.')
         sys.exit(1)
+
+def check_fasta(input_file):
+    """
+    Checks if the input file is a FASTA file.
+    """
+    # Check file extension
+    if not input_file.endswith('.fasta') and not input_file.endswith('.faa'):
+        print('Input file is not a FASTA file.')
+        return False
+    # Read first lines to check sequence content
+    with open(input_file) as f:
+        first_line = f.readline()
+        second_line = f.readline()
+        if not first_line.startswith('>'):
+            print('Invalid FASTA header format.')
+            return False
+        for char in second_line:
+            if char not in 'ACGT':
+                print('Invalid sequence characters.')
+                return False
+    return True
+
+def check_outf(outfile):
+    """
+    Checks if the output file is a valid file.
+    """
+    # See whether outfile arg is used
+    if outfile is None:
+        return False
+    else:
+        return True
+
+def check_taxid(taxid):
+    """
+    Checks if the taxid is a valid integer.
+    """
+    try:
+        int(taxid)
+    except ValueError:
+        print('Invalid taxid.')
+        return False
+    return True

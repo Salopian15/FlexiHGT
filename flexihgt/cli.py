@@ -1,26 +1,18 @@
-import argparse
 import sys
 from concurrent.futures import ThreadPoolExecutor
 import os
 import time
 from .core import HGTDetect
-
-def noargs(args):
-    """
-    Checks to see if arguments are provided
-    """
-    if len(args) == 0:
-        print("FlexiHGT: No arguments given, please run with -h or --help for help")
-        sys.exit()
-    else:
-        pass
-
+from .utils import check_fasta
 def main():
     """
     Runs main pipeline
     """
     hgt = HGTDetect()
     args = hgt.parse_args()
+    #if not check_fasta(args.input_file):
+    #    print(f"Error: {args.input_file} is not a valid FASTA file, please use protein fasta files only")
+    #    sys.exit(1)
     #hgt.set_params(args)
     host_taxlevel = hgt.get_refTax(args.query_tax, args.tax_level)
     genes = hgt.load_fasta(args.input_file, hgt.genes, hgt.geneSeq)
@@ -32,10 +24,9 @@ def main():
                                     combined_file, args, taxonomy_alignments,
                                     ranks, names, host_taxlevel), genes))
     results = [r for r in results if r is not None]
-    hgt.write_output(results, args.tax_level)
+    hgt.write_output(results, args.tax_level, args.outfile)
 
 if __name__ == "__main__":
-    noargs(sys.argv)
     start_time = time.time()
     main()
     end_time = time.time()

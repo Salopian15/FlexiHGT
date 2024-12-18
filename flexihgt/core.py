@@ -19,6 +19,7 @@ class HGTDetect:
         self.bitscore_parameter = 100
         self.HGTIndex = 0.5
         self.out_pct = 0.8
+        self.AI = 45
         self.tax_level = "family"
         self.search = "diamond"
         self.query_tax = None
@@ -30,21 +31,24 @@ class HGTDetect:
         #self.taxdb = "~/.etetoolkit/taxa.sqlite"
         self.taxdb = "~/.etetoolkit/taxa.sqlite"
         self.dmnd_dbpath = None
-
+        
     def parse_args(self) -> Any:
         """
         Parses command line arguments
         """
-        parser = argparse.ArgumentParser(description="Modified version of HGTPhyloDetect close workflow for HGT events, takes protein fasta file and iterates through each sequence outputting a likelihood of HGT origin for each", epilog="Author: Jack A. Crosby, Aberystwyth University/Queens University Belfast")
+        parser = argparse.ArgumentParser(
+            description="Modified version of HGTPhyloDetect close workflow for HGT events, takes protein fasta file and iterates through each sequence outputting a likelihood of HGT origin for each", epilog="Author: Jack A. Crosby, Aberystwyth University/Queens University Belfast")
         parser.add_argument("input_file", help="Input file path, should be a fasta file of protein sequences")
         parser.add_argument("--bitscore_parameter", type=float, default=100, help="Bitscore parameter, default is 100")
         parser.add_argument("--HGTIndex", type=float, default=0.5, help="HGT Index, default is 0.5")
         parser.add_argument("--out_pct", type=float, default=0.8, help="Out Pct, default is 0.8")
+        parser.add_argument("--AI", type=float, default=45, help="Alien Index, default is 45")
         parser.add_argument("-t", "--tax_level", type=str, default="family", choices=["superkingdom", "kingdom", "phylum", "subphylum", "class", "order", "family", "genus", "species"], help="Taxonomic level, organisms outisde of this level will be classified as 'outgroup', default is family.")
         parser.add_argument("-s", "--search", type=str, default="diamond", choices=["diamond", "mmseqs"], help="Search methods, diamond & mmseqs use local database for search, default is diamond.")
         parser.add_argument("-u", "--update", action="store_true", help="Update the NCBI taxonomy database")
-        parser.add_argument("-q", "--query_tax", type=int, help="Taxid associated with the query sequence")
+        parser.add_argument("-q", "--query_tax", type=int, help="Taxid associated with the query sequence", required=True)
         parser.add_argument("-db", "--database", help="Path to the search database, link to database file (e.g., Diamond or MMseqs database)", required=True)
+        parser.add_argument("-o", "--outfile", help="Output file name, default is output_taxlevel_HGT.tsv")
         return parser.parse_args()
 
     def set_params(self, args: Any) -> None:
@@ -54,10 +58,12 @@ class HGTDetect:
         self.bitscore_parameter = args.bitscore_parameter
         self.HGTIndex = args.HGTIndex
         self.out_pct = args.out_pct
+        self.AI = args.AI
         self.tax_level = args.tax_level.lower()
         self.search = args.search.lower()
         self.query_tax = args.query_tax
         self.dmnd_dbpath = args.database
+        self.outfile = args.outfile
         name = args.input_file
         bitscore_parameter = args.bitscore_parameter
         HGTIndex = args.HGTIndex
@@ -151,12 +157,12 @@ class HGTDetect:
             sys.exit()
         return gene_taxlevel
 
-    def get_query_taxids(self, result_file, accession_number):
+    def get_query_taxids(self, result_file: str, accession_number: List[str]) -> Tuple[List[str], Dict[str, str]]:
         """
         Get the taxids of the query sequences
         """
-        taxids = []
-        accession_to_taxid = {}  # To map each accession to its taxid for later use
+        taxids: List[str] = []
+        accession_to_taxid: Dict[str, str] = {}  # To map each accession to its taxid for later use
         for accession in accession_number[:200]:
             try:
                 taxid = self.get_taxid(result_file, accession)
@@ -167,9 +173,16 @@ class HGTDetect:
                 continue
         return taxids, accession_to_taxid
 
-    def get_taxid(self, gene_results, accession_number):
+    def get_taxid(self, gene_results: str, accession_number: str) -> str:
         """
         Gets taxids of results from diamond search result file
+        
+        Args:
+            gene_results: Path to the diamond results file
+            accession_number: Accession number to look up
+            
+        Returns:
+            str: The taxid for the given accession number
         """
         df = pd.read_csv(gene_results, sep='\t', header=None)
         filtered_results = df[df[1] == accession_number]
@@ -178,23 +191,26 @@ class HGTDetect:
 
     def hgt_calc(
         self, gene: str, max_outgroup_bitscore: float,
-        max_recipient_organism_bitscore: float,outgroup_species_number: int, 
-        recipient_species_number: int,HGT: List[List[Any]],
+        max_recipient_organism_bitscore: float, outgroup_species_number: int, 
+        recipient_species_number: int, HGT: List[List[Any]],
         HGTIndex: float, out_pct: float, tax_level: str, names: Dict[str, str],
         taxonomy_alignments: Dict[str, Dict[str, str]], bitscore_parameter: float,
-        donor_taxonomy: str
+        donor_taxonomy: str, min_ingroup_evalue: float, 
+        min_outgroup_evalue: float, AI: float, e_minus: float = 1e-200,
     ) -> List[List[Any]]:
         """
         Calculates the likelihood of a HGT event
         """
         HGT_index = format(max_outgroup_bitscore / max_recipient_organism_bitscore, '.4f')
+        alienindex = format(math.log(min_ingroup_evalue+e_minus, math.e)-math.log(min_outgroup_evalue+e_minus, math.e), '.2f')
         Outg_pct = format(outgroup_species_number / (outgroup_species_number + recipient_species_number), '.4f')
         print(f'HGT index: {HGT_index}', flush=True)
         print(f'Out_pct: {Outg_pct}', flush=True)
         is_hgt_event = (
             max_outgroup_bitscore >= bitscore_parameter and
             float(HGT_index) >= HGTIndex and
-            float(Outg_pct) >= out_pct
+            float(Outg_pct) >= out_pct and
+            float(alienindex) >= AI
         )
         if is_hgt_event:
             print('This is a HGT event', flush=True)
@@ -211,20 +227,24 @@ class HGTDetect:
         else:
             print('This is not a HGT event', flush=True)
             taxonomy = 'No'
-        item = [gene, max_outgroup_bitscore, Outg_pct, HGT_index, taxonomy]
+        item = [gene, max_outgroup_bitscore, Outg_pct, HGT_index, alienindex, taxonomy]
         HGT.append(item)
         return HGT
 
-    def write_output(self, HGT, tax_level):
+    def write_output(self, HGT: List[List[Any]], tax_level: str, outf: str) -> None:
         """
         Writes results of the HGT detection to a file
         """
-        outfile = open(f"./output_{tax_level}_HGT.tsv", "wt")
+        if outf is None:
+            outfile_name = f"output_{tax_level}_HGT.tsv"
+        else:
+            outfile_name = outf
+        outfile = open(f"./{outfile_name}", "wt", encoding="utf-8")
         tsv_writer = csv.writer(outfile, delimiter="\t")
-        column = ['Gene/Protein', 'Bitscore', 'Out_pct',
-                  'HGT index', 'Donor taxonomy']
+        column: List[str] = ['Gene/Protein', 'Bitscore', 'Out_pct',
+                             'HGT index', 'Alien Index', 'Donor taxonomy']
         tsv_writer.writerow(column)
-        for HGT_info in HGT :
+        for HGT_info in HGT:
             tsv_writer.writerow(HGT_info)
         outfile.close()
 
@@ -256,7 +276,7 @@ class HGTDetect:
             recipient_species = set()
             outgroup_accession = set()
             outgroup_species = set()
-            #evalue_dict = {}
+            evalue_dict = {}
             for accession, taxid in accession_to_taxid.items():
                 if taxid not in taxonomy_alignments:
                     print(f"Warning: Taxid {taxid} not found in taxonomy alignments. Skipping this accession.", flush=True)
@@ -268,22 +288,22 @@ class HGTDetect:
                 else:
                     outgroup_accession.add(accession)
                     outgroup_species.add(names.get(taxonomy_alignment.get('species'), 'Unknown'))
-                #evalue = gene_results[gene_results[1] == accession].iloc[0][2]
-                #evalue_dict[accession] = evalue
+                evalue = gene_results[gene_results[1] == accession].iloc[0][2]
+                evalue_dict[accession] = evalue
             recipient_accession_bitscore = {acc: bs for acc, bs in zip(accession_number, accession_bitscore) if acc in recipient_accession}
             outgroup_accession_bitscore = {acc: bs for acc, bs in zip(accession_number, accession_bitscore) if acc in outgroup_accession}
             max_recipient_organism_bitscore = max(recipient_accession_bitscore.values()) if recipient_accession_bitscore else 0
             max_outgroup_bitscore = max(outgroup_accession_bitscore.values()) if outgroup_accession_bitscore else 0
             recipient_species_number = len(recipient_species)
             outgroup_species_number = len(outgroup_species)
-            #se_minus = 1e-200
+            e_minus = 1e-200
             if max_outgroup_bitscore and max_recipient_organism_bitscore:
-                #min_outgroup_key = min(outgroup_accession_bitscore,
-                #                       key=outgroup_accession_bitscore.get)
-                #min_outgroup_evalue = evalue_dict.get(min_outgroup_key, e_minus)
-                #min_ingroup_key = min(recipient_accession_bitscore,
-                #                      key=recipient_accession_bitscore.get)
-                #min_ingroup_evalue = evalue_dict.get(min_ingroup_key, e_minus)
+                min_outgroup_key = min(outgroup_accession_bitscore,
+                                       key=outgroup_accession_bitscore.get)
+                min_outgroup_evalue = evalue_dict.get(min_outgroup_key, e_minus)
+                min_ingroup_key = min(recipient_accession_bitscore,
+                                      key=recipient_accession_bitscore.get)
+                min_ingroup_evalue = evalue_dict.get(min_ingroup_key, e_minus)
                 #alienindex = format(math.log(min_ingroup_evalue + e_minus, math.e) - math.log(min_outgroup_evalue + e_minus, math.e), '.2f')
                 donor_taxid = None
                 donor_taxonomy = 'Not available'
@@ -299,7 +319,8 @@ class HGTDetect:
                     gene, max_outgroup_bitscore, max_recipient_organism_bitscore,
                     outgroup_species_number, recipient_species_number, [],
                     args.HGTIndex, args.out_pct, args.tax_level,
-                    names, taxonomy_alignments, args.bitscore_parameter, donor_taxonomy
+                    names, taxonomy_alignments, args.bitscore_parameter, donor_taxonomy,
+                    min_ingroup_evalue, min_outgroup_evalue, args.AI, e_minus
                 )
                 print("Result for ", gene, "processed", flush= True)
                 return hgt_result[0] if hgt_result else None
