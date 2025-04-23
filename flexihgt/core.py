@@ -1,392 +1,748 @@
-#!/usr/bin/env python3
-import sys, os, warnings, math, csv, argparse, time
+import logging
+import sys
+import os
+import warnings
+import math
+import csv
+import argparse
+import time
+from pathlib import Path
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Set, Any, Optional, Iterator, NamedTuple, Union
 from concurrent.futures import ThreadPoolExecutor
-from ete3 import NCBITaxa
-from typing import List, Dict, Tuple, Set, Any
 from functools import lru_cache
 import pandas as pd
+import numpy as np
 from Bio import SeqIO, BiopythonWarning
+from ete3 import NCBITaxa
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class TaxonomyInfo(NamedTuple):
+    """Structure for taxonomy information"""
+    taxid: str
+    rank: str
+    name: str
+    lineage: Tuple[int, ...]
+    alignment: Dict[str, int]
+
+class HGTScores(NamedTuple):
+    """Structure for HGT-related scores"""
+    max_outgroup_bitscore: float
+    max_recipient_bitscore: float
+    hgt_index: float
+    out_pct: float
+    alien_index: float
+    outgroup_count: int
+    recipient_count: int
+    min_outgroup_evalue: float
+    min_recipient_evalue: float
+
+@dataclass
+class HGTParameters:
+    """Configuration parameters for HGT detection"""
+    bitscore_parameter: float = 100
+    hgt_index: float = 0.5
+    out_pct: float = 0.8
+    ai_threshold: float = 45
+    tax_level: str = "family"
+    search_method: str = "diamond"
+    e_minus: float = 1e-200
+    query_taxid: Optional[int] = None
+    max_hits: int = 200
+
+    def __post_init__(self):
+        """Validate parameters after initialization"""
+        if not 0 <= self.hgt_index <= 1:
+            raise ValueError("HGT index must be between 0 and 1")
+        if not 0 <= self.out_pct <= 1:
+            raise ValueError("Out percentage must be between 0 and 1")
+        if self.query_taxid is not None and self.query_taxid <= 0:
+            raise ValueError("Query taxid must be positive")
 
 class HGTDetect:
-    """
-    Class to detect HGT events in protein sequences
-    """
+    """Class to detect HGT events in protein sequences with improved performance and error handling"""
 
-    def __init__(self) -> None:
-        # Initialize the class
-        # Set up the NCBI Taxonomy database
+    SYNTHETIC_KEYWORDS = {
+                    'synthetic', 'vector', 'construct', 'artificial', 
+                    'engineered', 'cloning', 'expression', 'plasmid',
+                    'synthetic construct', 'vector:', 'plasmid:', 'cloning:',
+                    'expression:', 'artificial construct', 'engineered construct',
+                    'Synthetic', 'Vector', 'Construct', 'Artificial',
+                    'Engineered', 'Cloning', 'Expression', 'Plasmid',
+                    'Synthetic Construct', 'Vector:', 'Plasmid:', 'Cloning:',
+                    'Expression:', 'Artificial Construct', 'Engineered Construct'
+    }
+
+    TAX_RANKS = [
+        'species', 'subgenus', 'genus', 
+        'subtribe', 'tribe', 'subfamily', 'family', 'superfamily', 
+        'infraorder', 'suborder', 'order', 'superorder', 
+        'infraclass', 'subclass', 'class', 'superclass', 
+        'subphylum', 'phylum', 'superphylum', 
+        'subkingdom', 'kingdom', 'superkingdom'
+    ]
+
+    def __init__(self, params: Optional[HGTParameters] = None) -> None:
+        """Initialize HGT detection with optional custom parameters"""
+        self.params = params or HGTParameters()
         self.ncbi = NCBITaxa()
-        self.bitscore_parameter = 100
-        self.HGTIndex = 0.5
-        self.out_pct = 0.8
-        self.AI = 45
-        self.tax_level = "family"
-        self.search = "diamond"
-        self.query_tax = None
-        self.genes: List[str] = []
-        self.geneSeq: Dict[str, str] = {}
-        self.HGT: List[List[Any]] = []
-        self.set_params(self.parse_args())
-        #self.ncbi.update_taxonomy_database()
-        #self.taxdb = "~/.etetoolkit/taxa.sqlite"
-        self.taxdb = "~/.etetoolkit/taxa.sqlite"
-        self.dmnd_dbpath = None
-        
-    def parse_args(self) -> Any:
-        """
-        Parses command line arguments
-        """
-        parser = argparse.ArgumentParser(
-            description="Modified version of HGTPhyloDetect close workflow for HGT events, takes protein fasta file and iterates through each sequence outputting a likelihood of HGT origin for each", epilog="Author: Jack A. Crosby, Aberystwyth University/Queens University Belfast")
-        parser.add_argument("input_file", help="Input file path, should be a fasta file of protein sequences")
-        parser.add_argument("--bitscore_parameter", type=float, default=100, help="Bitscore parameter, default is 100")
-        parser.add_argument("--HGTIndex", type=float, default=0.5, help="HGT Index, default is 0.5")
-        parser.add_argument("--out_pct", type=float, default=0.8, help="Out Pct, default is 0.8")
-        parser.add_argument("--AI", type=float, default=45, help="Alien Index, default is 45")
-        parser.add_argument("-t", "--tax_level", type=str, default="family", choices=["superkingdom", "kingdom", "phylum", "subphylum", "class", "order", "family", "genus", "species"], help="Taxonomic level, organisms outisde of this level will be classified as 'outgroup', default is family.")
-        parser.add_argument("-s", "--search", type=str, default="diamond", choices=["diamond", "mmseqs"], help="Search methods, diamond & mmseqs use local database for search, default is diamond.")
-        parser.add_argument("-u", "--update", action="store_true", help="Update the NCBI taxonomy database")
-        parser.add_argument("-q", "--query_tax", type=int, help="Taxid associated with the query sequence", required=True)
-        parser.add_argument("-db", "--database", help="Path to the search database, link to database file (e.g., Diamond or MMseqs database)", required=True)
-        parser.add_argument("-o", "--outfile", help="Output file name, default is output_taxlevel_HGT.tsv")
-        return parser.parse_args()
+        self._setup_caches()
 
-    def set_params(self, args: Any) -> None:
-        """
-        Set the parameters
-        """
-        self.bitscore_parameter = args.bitscore_parameter
-        self.HGTIndex = args.HGTIndex
-        self.out_pct = args.out_pct
-        self.AI = args.AI
-        self.tax_level = args.tax_level.lower()
-        self.search = args.search.lower()
-        self.query_tax = args.query_tax
-        self.dmnd_dbpath = args.database
-        self.outfile = args.outfile
-        name = args.input_file
-        bitscore_parameter = args.bitscore_parameter
-        HGTIndex = args.HGTIndex
-        out_pct = args.out_pct
-        tax_level = args.tax_level.lower()
-        search = args.search.lower()
-        update = args.update
-        if update:
-            self.ncbi.update_taxonomy_database()
-        warnings.simplefilter('ignore', BiopythonWarning)
-        if self.dmnd_dbpath is None or not os.path.exists(self.dmnd_dbpath):
-            print(f'Error: database not found at {self.dmnd_dbpath}')
-            sys.exit()
-        # Print the table header
-        print("Input Parameters:")
-        print("-----------------")
-        print(f"{'Input File':<20} | {name}")
-        print(f"{'Bitscore Parameter':<20} | {bitscore_parameter}")
-        print(f"{'HGT Index':<20} | {HGTIndex}")
-        print(f"{'Outgroup Percentage':<20} | {out_pct}")
-        print(f"{'Taxonomic Level':<20} | {tax_level}")
-        print(f"{'Search Method':<20} | {search}")
-        print("-----------------")
+    def _setup_caches(self, cache_size: int = 10000) -> None:
+        """Initialize LRU caches with reasonable size limits"""
+        self.get_lineage = lru_cache(maxsize=cache_size)(self._get_lineage)
+        self.get_rank = lru_cache(maxsize=cache_size)(self._get_rank)
+        self.get_name = lru_cache(maxsize=cache_size)(self._get_name)
 
-    def load_fasta(self, name: str , genes: List[str], geneSeq: Dict[str, str]) -> List[str]:
-        """
-        Loads the fasta file into a dictionary
-        """
-        with open(name, 'r') as handleGene:
-            for record in SeqIO.parse(handleGene, "fasta"):
-                gene = str(record.id)
-                sequence = str(record.seq)
-                geneSeq[gene] = sequence
-                genes.append(gene)
-        return genes
-
-    def run_search(self, name: str) -> None:
-        """
-        Runs the homology search
-        """
-        outf = str(name.split(".")[0] + ".tsv")
-        if os.path.exists(f"{os.path.splitext(name)[0]}.tsv") and os.path.getsize(f"{os.path.splitext(name)[0]}.tsv") > 0:
-        #accession_number, accession_bitscore = parse_NCBI(gene)
-            print(f'Diamond file found for {os.path.splitext(name)[0]}')
-            return
-        elif self.search == "diamond":
-            myCmd =f'diamond blastp -d {self.dmnd_dbpath} -q {name} --max-target-seqs 250 --outfmt 6 qseqid sseqid evalue bitscore length pident staxids -o {outf}'
-            myCmd = str(myCmd)
-            os.system(myCmd)
-        elif self.search == "mmseqs":
-            myCmd = f'mmseqs easy-search {name} {self.dmnd_dbpath} {outf} --max-seqs 250 --format-output "query,target,evalue,bits,alnlen,pident,taxid'
-            myCmd = str(myCmd)
-            os.system(myCmd)
-        else:
-            print("Error: Search method not recognized")
-            sys.exit()  
-
-    def load_diamond_results(self, combined_file: str , gene: str) -> pd.DataFrame:
-        """
-        Load the diamond results file into a dataframe and filter for the gene of interest
-        """
+    def precompute_taxonomy(self, diamond_results: pd.DataFrame) -> Dict[str, TaxonomyInfo]:
+        """Precompute all taxonomy information using ete3, including handling merged TaxIDs."""
         try:
-            results=pd.read_csv(combined_file, sep='\t', header=None)
-            gene_results = results[results[0] == gene]
-        except pd.errors.EmptyDataError:
-            print(f"Error: No results found for {gene}")
-            sys.exit()
-        return gene_results
+            # Initialize NCBITaxa
+            ncbi = NCBITaxa()
 
-    def get_refTax(self, qtaxid: int, tax_level: str) -> int:
-        """
-        Get the taxonomy of the host organism (the organism of the input sequences)
-        """
-        try:
-            gene_lineage = self.ncbi.get_lineage(qtaxid)
-            gene_lineage2ranks = self.ncbi.get_rank(gene_lineage)
-            gene_ranks2lineage = dict((rank, taxid) for (taxid, rank) in gene_lineage2ranks.items())
-            gene_taxonomy_alignment = gene_ranks2lineage
-            gene_taxlevel = gene_taxonomy_alignment.get(tax_level)
-            
-            if gene_taxlevel is None:
-                raise ValueError(f"Specified tax_level '{tax_level}' not found in the lineage")
-            #print("Gene Taxonomy Information:")
-            #print("--------------------------")
-            #for rank, taxid in gene_taxonomy_alignment.items():
-            #    print(f"{rank.capitalize():<20} | {taxid}")
-            #print("--------------------------")
-        except Exception as e:
-            print(f"Error type: {e.__class__.__name__}, Message: {e}")
-            print("Exiting...")
-            sys.exit()
-        return gene_taxlevel
-
-    def get_query_taxids(self, result_file: str, accession_number: List[str]) -> Tuple[List[str], Dict[str, str]]:
-        """
-        Get the taxids of the query sequences
-        """
-        taxids: List[str] = []
-        accession_to_taxid: Dict[str, str] = {}  # To map each accession to its taxid for later use
-        for accession in accession_number[:200]:
-            try:
-                taxid = self.get_taxid(result_file, accession)
-                taxids.append(taxid)
-                accession_to_taxid[accession] = taxid
-            except Exception as e:
-                print(f"Error fetching taxid for {accession}: {e}")
-                continue
-        return taxids, accession_to_taxid
-
-    def get_taxid(self, gene_results: str, accession_number: str) -> str:
-        """
-        Gets taxids of results from diamond search result file
-        
-        Args:
-            gene_results: Path to the diamond results file
-            accession_number: Accession number to look up
-            
-        Returns:
-            str: The taxid for the given accession number
-        """
-        df = pd.read_csv(gene_results, sep='\t', header=None)
-        filtered_results = df[df[1] == accession_number]
-        taxid = filtered_results[6].str.split(';').str[-1].values[0]
-        return taxid
-
-    def hgt_calc(
-        self, gene: str, max_outgroup_bitscore: float,
-        max_recipient_organism_bitscore: float, outgroup_species_number: int, 
-        recipient_species_number: int, HGT: List[List[Any]],
-        HGTIndex: float, out_pct: float, tax_level: str, names: Dict[str, str],
-        taxonomy_alignments: Dict[str, Dict[str, str]], bitscore_parameter: float,
-        donor_taxonomy: str, min_ingroup_evalue: float, 
-        min_outgroup_evalue: float, AI: float, e_minus: float = 1e-200,
-    ) -> List[List[Any]]:
-        """
-        Calculates the likelihood of a HGT event
-        """
-        HGT_index = format(max_outgroup_bitscore / max_recipient_organism_bitscore, '.4f')
-        alienindex = format(math.log(min_ingroup_evalue+e_minus, math.e)-math.log(min_outgroup_evalue+e_minus, math.e), '.2f')
-        Outg_pct = format(outgroup_species_number / (outgroup_species_number + recipient_species_number), '.4f')
-        print(f'HGT index: {HGT_index}', flush=True)
-        print(f'Out_pct: {Outg_pct}', flush=True)
-        is_hgt_event = (
-            max_outgroup_bitscore >= bitscore_parameter and
-            float(HGT_index) >= HGTIndex and
-            float(Outg_pct) >= out_pct and
-            float(alienindex) >= AI
-        )
-        if is_hgt_event:
-            print('This is a HGT event', flush=True)
-            taxonomy = donor_taxonomy
-            # check if donor_taxonomy is not empty
-            if donor_taxonomy:
-                taxonomy = donor_taxonomy
-            else:
-                taxonomy = 'Not available'
-            #for taxid, alignment in taxonomy_alignments.items():
-            #    if tax_level in alignment:
-            #        taxonomy = names.get(alignment[tax_level], 'Not available')
-            #        break
-        else:
-            print('This is not a HGT event', flush=True)
-            taxonomy = 'No'
-        item = [gene, max_outgroup_bitscore, Outg_pct, HGT_index, alienindex, taxonomy]
-        HGT.append(item)
-        return HGT
-
-    def write_output(self, HGT: List[List[Any]], tax_level: str, outf: str) -> None:
-        """
-        Writes results of the HGT detection to a file
-        """
-        if outf is None:
-            outfile_name = f"output_{tax_level}_HGT.tsv"
-        else:
-            outfile_name = outf
-        outfile = open(f"./{outfile_name}", "wt", encoding="utf-8")
-        tsv_writer = csv.writer(outfile, delimiter="\t")
-        column: List[str] = ['Gene/Protein', 'Bitscore', 'Out_pct',
-                             'HGT index', 'Alien Index', 'Donor taxonomy']
-        tsv_writer.writerow(column)
-        for HGT_info in HGT:
-            tsv_writer.writerow(HGT_info)
-        outfile.close()
-
-    def process_gene(self, gene, combined_file, args, taxonomy_alignments, ranks, names, hosttax):
-        """
-        Runs the main analysis for each gene, slices the results 
-        for the first 200 hits and returns the HGT results
-        """
-        try:
-            # Slices first 200 hits and pulls out the accession number, bitscore and taxids
-            gene_results = self.load_diamond_results(combined_file, gene)
-            gene_results = gene_results[:200]
-            gene_results = gene_results.dropna(subset=[6])
-            accession_number = gene_results[1].values
-            accession_bitscore = gene_results[3].values
-            taxids = gene_results[6].str.split(';').str[-1].values
-            accession_to_taxid = dict(zip(accession_number, taxids))
-            #print(f"Debug: Query taxid {args.query_tax}, Taxonomy alignments keys: {list(taxonomy_alignments.keys())[:10]}...")
-            gene_taxlevel = taxonomy_alignments[str(args.query_tax)].get(args.tax_level)
-            #gene_taxlevel = hosttax
-            #if str(args.query_tax) not in taxonomy_alignments:
-            #    print(f"Warning: Query taxid {args.query_tax} not found in taxonomy alignments. Skipping gene {gene}.")
-            #    return None
-            
-            if gene_taxlevel is None:
-                print(f"Warning: Tax level {args.tax_level} not found for query taxid {args.query_tax}. Skipping gene {gene}.", flush=True)
-                return None
-            recipient_accession = set()
-            recipient_species = set()
-            outgroup_accession = set()
-            outgroup_species = set()
-            evalue_dict = {}
-            for accession, taxid in accession_to_taxid.items():
-                if taxid not in taxonomy_alignments:
-                    print(f"Warning: Taxid {taxid} not found in taxonomy alignments. Skipping this accession.", flush=True)
+            # Extract unique taxids from input and clean them
+            unique_taxids = set()
+            for taxid in pd.concat([
+                diamond_results[6].dropna().str.split(';').str[-1],
+                pd.Series([str(self.params.query_taxid)])
+            ]):
+                try:
+                    if pd.notna(taxid) and str(taxid).strip():
+                        unique_taxids.add(int(float(taxid)))
+                except (ValueError, TypeError):
+                    logger.warning(f"Invalid taxid found: {taxid}")
                     continue
-                taxonomy_alignment = taxonomy_alignments[taxid]
-                if args.tax_level in taxonomy_alignment and taxonomy_alignment[args.tax_level] == gene_taxlevel:
-                    recipient_accession.add(accession)
-                    recipient_species.add(names.get(taxonomy_alignment.get('species'), 'Unknown'))
-                else:
-                    outgroup_accession.add(accession)
-                    outgroup_species.add(names.get(taxonomy_alignment.get('species'), 'Unknown'))
-                evalue = gene_results[gene_results[1] == accession].iloc[0][2]
-                evalue_dict[accession] = evalue
-            recipient_accession_bitscore = {acc: bs for acc, bs in zip(accession_number, accession_bitscore) if acc in recipient_accession}
-            outgroup_accession_bitscore = {acc: bs for acc, bs in zip(accession_number, accession_bitscore) if acc in outgroup_accession}
-            max_recipient_organism_bitscore = max(recipient_accession_bitscore.values()) if recipient_accession_bitscore else 0
-            max_outgroup_bitscore = max(outgroup_accession_bitscore.values()) if outgroup_accession_bitscore else 0
-            recipient_species_number = len(recipient_species)
-            outgroup_species_number = len(outgroup_species)
-            e_minus = 1e-200
-            if max_outgroup_bitscore and max_recipient_organism_bitscore:
-                min_outgroup_key = min(outgroup_accession_bitscore,
-                                       key=outgroup_accession_bitscore.get)
-                min_outgroup_evalue = evalue_dict.get(min_outgroup_key, e_minus)
-                min_ingroup_key = min(recipient_accession_bitscore,
-                                      key=recipient_accession_bitscore.get)
-                min_ingroup_evalue = evalue_dict.get(min_ingroup_key, e_minus)
-                #alienindex = format(math.log(min_ingroup_evalue + e_minus, math.e) - math.log(min_outgroup_evalue + e_minus, math.e), '.2f')
-                donor_taxid = None
-                donor_taxonomy = 'Not available'
-                if outgroup_accession_bitscore:
-                    max_outgroup_acc = max(outgroup_accession_bitscore, key=outgroup_accession_bitscore.get)
-                    donor_taxid = accession_to_taxid.get(max_outgroup_acc)
-                    if donor_taxid in taxonomy_alignments:
-                        donor_alignment = taxonomy_alignments[donor_taxid]
-                        if args.tax_level in donor_alignment:
-                            donor_taxonomy = names.get(donor_alignment[args.tax_level], 'Not available')
 
-                hgt_result = self.hgt_calc(
-                    gene, max_outgroup_bitscore, max_recipient_organism_bitscore,
-                    outgroup_species_number, recipient_species_number, [],
-                    args.HGTIndex, args.out_pct, args.tax_level,
-                    names, taxonomy_alignments, args.bitscore_parameter, donor_taxonomy,
-                    min_ingroup_evalue, min_outgroup_evalue, args.AI, e_minus
-                )
-                print("Result for ", gene, "processed", flush= True)
-                return hgt_result[0] if hgt_result else None
-            else:
-                print(f"Skipping HGT calculation for gene {gene} due to missing bitscore data", flush=True)
-                return None
+            # Handle merged TaxIDs
+            final_taxids, merged_map = ncbi._translate_merged(list(unique_taxids))
+            final_taxids = list(final_taxids)
+
+            # Fetch taxonomy data in bulk
+            lineages = ncbi.get_lineage_translator(final_taxids)
+            ranks = ncbi.get_rank(final_taxids)
+            names = ncbi.get_taxid_translator(final_taxids)
+
+            # Build taxonomy dictionary with validation and alignments
+            taxonomy_info = {}
+            for orig_id in unique_taxids:
+                try:
+                    final_id = merged_map.get(orig_id, orig_id)
+                    lineage = lineages.get(final_id, [])
+                    lineageorig = lineages.get(orig_id, [])
+                    if not lineage or not lineageorig:
+                        logger.warning(f"No lineage found for taxid {orig_id}")
+                        continue
+                    # Check if lineage is empty and use lineageorig if available
+                    if not lineage and lineageorig:
+                        lineage = lineageorig
+                    # Create taxonomy alignment as in reference code
+                    gene_lineage = lineage
+                    gene_lineage2ranks = ncbi.get_rank(gene_lineage)
+                    gene_ranks2lineage = dict((rank, taxid) for (taxid, rank) in gene_lineage2ranks.items())
+                    taxonomy_alignment = gene_ranks2lineage
+
+                    # Create TaxonomyInfo with alignment included
+                    taxonomy_info[str(orig_id)] = TaxonomyInfo(
+                        taxid=str(final_id),
+                        rank=ranks.get(final_id, "unknown"),
+                        name=names.get(final_id, "unknown"),
+                        lineage=tuple(lineage),
+                        alignment=taxonomy_alignment
+                    )
+
+                except Exception as e:
+                    logger.warning(f"Error processing taxid {orig_id}: {str(e)}")
+                    continue
+
+            logger.info(f"Successfully precomputed taxonomy for {len(taxonomy_info)} taxids")
+
+            # Save to file for debugging/reference
+            with open("taxonomy_info.csv", "w") as f:
+                writer = csv.writer(f, delimiter='\t')
+                writer.writerow(["taxid", "rank", "name", "lineage", "alignment"])
+                for taxid, info in taxonomy_info.items():
+                    writer.writerow([
+                        info.taxid,
+                        info.rank,
+                        info.name,
+                        info.lineage,
+                        str(info.alignment)
+                    ])
+
+            return taxonomy_info
+
         except Exception as e:
-            print(f'Error in process_gene for gene {gene}: {e.__class__.__name__}, Message: {e}', flush=True)
+            logger.error(f"Failed to precompute taxonomy: {str(e)}")
+            return {}
+
+
+
+    def _get_taxonomy_alignment(self, taxid: str, taxonomy_info: Dict[str, TaxonomyInfo]) -> Dict[str, int]:
+        """Get taxonomy alignment at different ranks"""
+        try:
+            tax_info = taxonomy_info.get(str(taxid))
+            if not tax_info or not tax_info.lineage:
+                return {}
+
+            # Get ranks for all taxids in lineage
+            ranks = {str(tid): self.ncbi.get_rank([tid])[tid]
+                    for tid in tax_info.lineage}
+
+            # Create alignment dictionary
+            alignment = {}
+            for tid, rank in ranks.items():
+                if rank in self.TAX_RANKS:
+                    alignment[rank] = tid
+
+            return alignment
+        except Exception as e:
+            logger.warning(f"Error getting taxonomy alignment for {taxid}: {e}")
+            return {}
+
+    def _is_recipient_taxid(self, taxid: str, taxonomy_info: Dict[str, TaxonomyInfo]) -> bool:
+        """Check if taxid belongs to recipient group based on tax level"""
+        if not self.params.query_taxid:
+            return False
+
+        try:
+            # Get taxonomy info directly
+            query_info = taxonomy_info.get(str(self.params.query_taxid))
+            target_info = taxonomy_info.get(str(taxid))
+            
+            if not query_info or not target_info:
+                return False
+                
+            # Compare at specified tax level using alignments
+            query_taxlevel = query_info.alignment.get(self.params.tax_level)
+            target_taxlevel = target_info.alignment.get(self.params.tax_level)
+            
+            if query_taxlevel and target_taxlevel:
+                return query_taxlevel == target_taxlevel
+                
+            return False
+            
+        except Exception as e:
+            logger.warning(f"Error comparing taxids {taxid}: {str(e)}")
+            return False
+
+    def _calculate_scores(self, results: pd.DataFrame, taxonomy_info: Dict[str, TaxonomyInfo]) -> HGTScores:
+        """Calculate HGT-related scores using taxonomy alignments from TaxonomyInfo"""
+        try:
+            # Split hits based on taxonomy alignment
+            is_recipient = results[6].str.split(';').str[-1].apply(
+                lambda x: self._is_recipient_taxid(str(x).strip(), taxonomy_info)
+            )
+            recipient_hits = results[is_recipient]
+            outgroup_hits = results[~is_recipient]
+
+            if recipient_hits.empty or outgroup_hits.empty:
+                logger.warning("No recipient or outgroup hits found, skipping scores.")
+                logger.info(
+                    "Recipient hits: %s, "
+                    "Outgroup hits: %s",
+                    len(
+                        recipient_hits
+                    ),
+                    len(
+                        outgroup_hits
+                    )
+                )
+                return HGTScores(
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                )
+                
+            # Get unique species counts using taxonomy alignments directly from TaxonomyInfo
+            recipient_species: Set[int] = set()
+            outgroup_species: Set[int] = set()
+            
+            # Process species for both recipient and outgroup hits
+            for hits, species_set in [(recipient_hits, recipient_species), 
+                                    (outgroup_hits, outgroup_species)]:
+                for taxid in hits[6].str.split(';').str[-1].unique():
+                    tax_info = taxonomy_info.get(str(taxid))
+                    if tax_info and 'species' in tax_info.alignment:
+                        species_set.add(tax_info.alignment['species'])
+
+            # Calculate scores
+            max_recipient_bitscore = recipient_hits[3].max()
+            max_outgroup_bitscore = outgroup_hits[3].max()
+
+            # Calculate HGT index with safety checks
+            hgt_index = (max_outgroup_bitscore / max_recipient_bitscore 
+                        if max_recipient_bitscore > 0 else 0)
+
+            # Calculate species counts
+            total_species = len(recipient_species) + len(outgroup_species)
+            out_pct = len(outgroup_species) / total_species if total_species > 0 else 0
+
+            # Calculate alien index
+            min_recipient_evalue = recipient_hits[2].min()
+            min_outgroup_evalue = outgroup_hits[2].min()
+            e_minus = 1e-200
+
+            alien_index = (
+                math.log(min_recipient_evalue + e_minus) -
+                math.log(min_outgroup_evalue + e_minus)
+            )
+
+            return HGTScores(
+                max_outgroup_bitscore=max_outgroup_bitscore,
+                max_recipient_bitscore=max_recipient_bitscore,
+                hgt_index=hgt_index,
+                out_pct=out_pct,
+                alien_index=alien_index,
+                outgroup_count=len(outgroup_species),
+                recipient_count=len(recipient_species),
+                min_outgroup_evalue=min_outgroup_evalue,
+                min_recipient_evalue=min_recipient_evalue
+            )
+
+        except Exception as e:
+            logger.error("Error calculating scores: %s", e)
+            return HGTScores(0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+    def process_fasta(self, fasta_path: Path, batch_size: int = 1000) -> Iterator[Tuple[str, str]]:
+        """Process FASTA file in batches to conserve memory"""
+        with open(fasta_path, encoding='UTF-8') as handle:
+            batch = []
+            for record in SeqIO.parse(handle, "fasta"):
+                batch.append((str(record.id), str(record.seq)))
+                if len(batch) >= batch_size:
+                    yield from batch
+                    batch = []
+            if batch:
+                yield from batch
+        logger.info("Finished processing FASTA file: %s", fasta_path)
+
+    def run_diamond_search(self, input_file: Path, db_path: Path) -> Path:
+        """Run DIAMOND search with better error handling and validation"""
+        if not db_path.exists():
+            raise FileNotFoundError(f"Database not found: {db_path}")
+
+        output_file = input_file.with_suffix('.tsv')
+        if output_file.exists() and output_file.stat().st_size > 0:
+            logger.info(f'Using existing Diamond results: {output_file}')
+            return output_file
+
+        cmd = (
+            f'diamond blastp -d {db_path} -q {input_file} '
+            '--max-target-seqs 250 --outfmt 6 qseqid sseqid evalue bitscore length pident staxids '
+            f'-o {output_file} '
+            f'--taxon-exclude {self.params.query_taxid}'  # Now part of the same string
+        )
+
+        logger.info(f"Running Diamond search: {cmd}")
+        result = os.system(cmd)
+        if result != 0:
+            raise RuntimeError(f"Diamond search failed with exit code {result}")
+
+        logger.info("Finished Diamond search. Results saved to %s", output_file)
+        return output_file
+
+    def process_single_gene(self, gene: str, gene_results: pd.DataFrame,
+                          taxonomy_info: Dict[str, TaxonomyInfo]) -> Optional[Dict[str, Any]]:
+        """Process a single gene with precomputed taxonomy information"""
+        try:
+            if gene_results.empty:
+                logger.warning("No results found for gene %s", gene)
+                return None
+
+            # Filter synthetic results using precomputed taxonomy
+            gene_results = self._filter_synthetic_results(gene_results, taxonomy_info)
+            if gene_results is None or gene_results.empty:
+                logger.warning("No non-synthetic results for gene %s", gene)
+                return None
+
+            # Calculate scores using precomputed taxonomy
+            scores = self._calculate_scores(gene_results, taxonomy_info)
+            
+            # Extract top hits (both recipient and outgroup)
+            top_hits = self._extract_top_hits(gene_results, taxonomy_info, n=5)
+            
+            if self._meets_hgt_criteria(scores):
+                logger.info("Gene %s meets HGT criteria. Scores: %s", gene, scores)
+            if not self._meets_hgt_criteria(scores):
+                logger.info("Gene %s does not meet HGT criteria.", gene)
+                return None
+
+            return {
+                'gene': gene,
+                'scores': scores,
+                'taxonomy': self._get_taxonomy_info(gene_results, scores, taxonomy_info),
+                'top_hits': top_hits  # Add top hits to the results
+            }
+
+        except Exception as e:
+            logger.error(f"Error processing gene {gene}: {e}", exc_info=True)
             return None
 
-    @lru_cache(maxsize=None)
-    def get_lineage(self, taxid: int) -> Tuple[int, ...]:
-        """Cached method to get lineage for a taxid."""
-        return tuple(self.ncbi.get_lineage(taxid))
+    def process_genes_parallel(self, genes: List[str], diamond_results: pd.DataFrame,
+                             taxonomy_info: Dict[str, TaxonomyInfo],
+                             num_workers: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Process genes in parallel using ProcessPoolExecutor"""
+        num_workers = num_workers if num_workers is not None else (os.cpu_count() or 1)
 
-    @lru_cache(maxsize=None)
-    def get_rank(self, taxid: int) -> str:
-        """Cached method to get rank for a taxid."""
-        return self.ncbi.get_rank([taxid])[taxid]
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = []
+            for gene in genes:
+                future = executor.submit(
+                    self.process_single_gene,
+                    gene,
+                    diamond_results[diamond_results[0] == gene],
+                    taxonomy_info
+                )
+                futures.append(future)
 
-    @lru_cache(maxsize=None)
-    def get_name(self, taxid: int) -> str:
-        """Cached method to get name for a taxid."""
-        return self.ncbi.get_taxid_translator([taxid])[taxid]
+            results = []
+            for future in futures:
+                try:
+                    result = future.result()
+                    if result:
+                        results.append(result)
+                except Exception as e:
+                    logger.error("Error processing gene: %s", e, exc_info=True)
+                    continue
+        logger.info("Finished processing %d genes", len(genes))
+        return results
 
-    def fetch_all_taxonomy_data(self, combined_file: str, query_taxid: int) -> Tuple[Dict[str, Dict[str, int]], Dict[int, str], Dict[int, str]]:
+    def run_analysis(self, input_file: Path, db_path: Path) -> pd.DataFrame:
+        """Main method to run the complete HGT analysis pipeline"""
+        try:
+            # Validate input files
+            if not input_file.exists():
+                raise FileNotFoundError(f"Input file not found: {input_file}")
+            if not db_path.exists():
+                raise FileNotFoundError(f"Database not found: {db_path}")
+
+            # Run DIAMOND search
+            diamond_results_path = self.run_diamond_search(input_file, db_path)
+            diamond_results = pd.read_csv(diamond_results_path, sep='\t', header=None)
+
+            # Precompute taxonomy information
+            logger.info("Precomputing taxonomy information...")
+            taxonomy_info = self.precompute_taxonomy(diamond_results)
+
+            # Load and preprocess sequences
+            sequences = list(self.process_fasta(input_file))
+            genes = [seq[0] for seq in sequences]
+
+            # Process genes in parallel with precomputed taxonomy
+            results = self.process_genes_parallel(genes, diamond_results, taxonomy_info)
+
+            # Convert results to DataFrame
+            df = pd.DataFrame(results)
+
+            # Write results
+            self._write_results(df, input_file.stem)
+            logger.info("Analysis complete")
+            logger.info("Found %d potential HGT events", len(df))
+            logger.info("Results saved to %s", f"{input_file.stem}_hgt_results.tsv")
+            return df
+
+        except Exception as e:
+            logger.error("Analysis failed: %s", e, exc_info=True)
+            raise
+
+    def _meets_hgt_criteria(self, scores: HGTScores) -> bool:
         """
-        Fetches all the taxonomy data from the diamond results file
+        Determine if a gene meets the criteria for HGT
         """
-        df = pd.read_csv(combined_file, sep='\t', header=None, usecols=[6])
-        df[6] = df[6].fillna('').astype(str)
-        unique_taxids: Set[int] = set()
-        for tid in df[6].str.split(';').explode().unique():
-            try:
-                if tid and not pd.isna(tid):
-                    unique_taxids.add(int(float(tid)))
-            except ValueError:
-                print(f"Warning: Invalid taxid '{tid}'. Skipping.")
+        return (
+            scores.max_outgroup_bitscore >= self.params.bitscore_parameter and
+            scores.hgt_index >= self.params.hgt_index and
+            scores.out_pct >= self.params.out_pct and
+            scores.alien_index >= self.params.ai_threshold
+        )
+
+    def _filter_synthetic_results(self, gene_results: pd.DataFrame, 
+                                taxonomy_info: Dict[str, TaxonomyInfo]) -> Optional[pd.DataFrame]:
+        """Filter synthetic results using precomputed taxonomy"""
+        def check_taxid(taxid: str) -> bool:
+            info = taxonomy_info.get(taxid)
+            if info is None:
+                return False
+            return not any(keyword in info.name.lower() for keyword in self.SYNTHETIC_KEYWORDS)
+
+        mask = gene_results[6].str.split(';').str[-1].apply(check_taxid)
+        filtered_df = gene_results[mask]
+
+        if filtered_df.empty:
+            logger.warning("All hits were synthetic constructs")
+            return None
+
+        return filtered_df
+
+
+    def _get_taxonomy_info(
+        self,
+        results: pd.DataFrame,
+        scores: HGTScores,
+        taxonomy_info: Dict[str, TaxonomyInfo]
+    ) -> Dict[str, Union[str, Dict[str, str]]]:
+        """Get detailed taxonomy information for potential HGT donors"""
+        if not scores.max_outgroup_bitscore:
+            return {"donor_taxonomy": "No potential donors found"}
+
+        # Get the hit with maximum bitscore from outgroup
+        max_hit = results[
+            (results[3] == scores.max_outgroup_bitscore) &
+            (results[6].str.split(';').str[-1].map(
+                lambda x: not self._is_recipient_taxid(x, taxonomy_info)
+            ))
+        ].iloc[0]
+
+        donor_taxid = max_hit[6].split(';')[-1]
+        donor_info = taxonomy_info.get(donor_taxid)
+
+        if donor_info is None:
+            return {"donor_taxonomy": "Taxonomy lookup failed"}
+
+        try:
+            lineage_info = {
+                str(taxid): taxonomy_info.get(str(taxid))
+                for taxid in donor_info.lineage
+                if str(taxid) in taxonomy_info
+            }
+
+            return {
+                "donor_taxid": donor_taxid,
+                "donor_taxonomy": {
+                    info.rank: info.name
+                    for info in lineage_info.values()
+                    if info and info.rank
+                },
+                "donor_alignment": donor_info.alignment
+            }
+
+        except Exception as e:
+            logger.error("Error getting donor taxonomy: %s", str(e))
+            return {"donor_taxonomy": "Taxonomy lookup failed"}
+
+    def _write_results(self, results: pd.DataFrame, prefix: str) -> None:
+        """Write analysis results to files in a structured TSV format
         
-        unique_taxids.add(query_taxid)
-        lineages: Dict[int, Tuple[int, ...]] = {}
-        for tid in unique_taxids:
-            try:
-                lineages[tid] = self.get_lineage(tid)
-            except Exception as e:
-                print(f"Error fetching lineage for taxid {tid}: {e}")
-        all_taxids: Set[int] = set(tid for lineage in lineages.values() for tid in lineage) | unique_taxids
-        ranks: Dict[int, str] = {}
-        names: Dict[int, str] = {}
-        for tid in all_taxids:
-            try:
-                ranks[tid] = self.get_rank(tid)
-                names[tid] = self.get_name(tid)
-            except Exception as e:
-                print(f"Error fetching rank or name for taxid {tid}: {e}")
-        taxonomy_alignments: Dict[str, Dict[str, int]] = {}
-        for taxid, lineage in lineages.items():
-            taxonomy_alignments[str(taxid)] = {ranks[tid]: tid for tid in lineage if tid in ranks}
-            taxonomy_alignments[str(taxid)][ranks.get(taxid, 'no rank')] = taxid
-        return taxonomy_alignments, ranks, names
+        Args:
+            results: DataFrame containing HGT analysis results
+            prefix: Prefix for output filenames
+        """
+        # Write main results
+        output_file = f"{prefix}_hgt_results.tsv"
+        if results.empty:
+            logger.warning("No results to write")
+            return
 
+        try:
+            with open(output_file, 'w', encoding='utf-8') as outfile:
+                tsv_writer = csv.writer(outfile, delimiter='\t')
+                
+                # Write header
+                columns = [
+                    'Gene/Protein',
+                    'Bitscore',
+                    'Out_pct', 
+                    'HGT index',
+                    'Alien Index',
+                    'Min Outgroup E-value',
+                    'Donor taxonomy'
+                ]
+                tsv_writer.writerow(columns)
 
-#if __name__ == "__main__":
-#    start_time = time.time()
-#    main()
-#    end_time = time.time()
-#    elapsed_time = (end_time - start_time) / 3600
-#    print(f"Elapsed time: {elapsed_time}: hours")
-# End of Phylotest.py
+                # Process each result row
+                for _, row in results.iterrows():
+                    scores = row['scores']
+                    taxonomy = row['taxonomy']
+
+                    # Format donor taxonomy string
+                    donor_tax = taxonomy.get('donor_taxonomy', {})
+                    if isinstance(donor_tax, dict):
+                        donor_tax_str = '; '.join(f"{rank}: {name}" 
+                                                  for rank, name in donor_tax.items())
+                    else:
+                        donor_tax_str = str(donor_tax)
+
+                    # Prepare row data
+                    row_data = [
+                        row['gene'],
+                        f"{scores.max_outgroup_bitscore:.2f}",
+                        f"{scores.out_pct:.2f}",
+                        f"{scores.hgt_index:.2f}",
+                        f"{scores.alien_index:.2f}",
+                        f"{scores.min_outgroup_evalue:.2e}",
+                        donor_tax_str
+                    ]
+
+                    tsv_writer.writerow(row_data)
+
+        except Exception as e:
+            logger.error(f"Error writing results: {str(e)}")
+            raise
+
+        # Add a new file for top hits
+        if not results.empty:
+            hits_file = f"{prefix}_top_hits.tsv"
+            with open(hits_file, 'w', encoding='utf-8') as f:
+                tsv_writer = csv.writer(f, delimiter='\t')
+                
+                # Write header
+                header = ['Gene', 'Hit Type', 'Subject ID', 'E-value', 'Bitscore', 'TaxID', 'Species']
+                tsv_writer.writerow(header)
+                
+                # Write hits for each gene
+                for _, row in results.iterrows():
+                    gene = row['gene']
+                    top_hits = row.get('top_hits', {'recipient': [], 'outgroup': []})
+                    
+                    # Write recipient hits
+                    for hit in top_hits.get('recipient', []):
+                        tsv_writer.writerow([
+                            gene,
+                            'Recipient',
+                            hit['subject_id'],
+                            f"{hit['evalue']:.2e}",
+                            f"{hit['bitscore']:.2f}",
+                            hit['taxid'],
+                            hit['species']
+                        ])
+                    
+                    # Write outgroup hits
+                    for hit in top_hits.get('outgroup', []):
+                        tsv_writer.writerow([
+                            gene,
+                            'Outgroup',
+                            hit['subject_id'],
+                            f"{hit['evalue']:.2e}",
+                            f"{hit['bitscore']:.2f}",
+                            hit['taxid'],
+                            hit['species']
+                        ])
+                
+                logger.info(f"Top hits written to {hits_file}")
+
+    # Base methods for caching
+    def _get_lineage(self, taxid: int) -> Tuple[int, ...]:
+        """Get taxonomy lineage for a taxid"""
+        try:
+            return tuple(self.ncbi.get_lineage(taxid))
+        except Exception as e:
+            logger.error(f"Error getting lineage for taxid {taxid}: {e}")
+            return tuple()
+
+    def _get_rank(self, taxid: int) -> str:
+        """Get taxonomic rank for a taxid"""
+        try:
+            return self.ncbi.get_rank([taxid])[taxid]
+        except Exception as e:
+            logger.error(f"Error getting rank for taxid {taxid}: {e}")
+            return "unknown"
+
+    def _get_name(self, taxid: int) -> str:
+        """Get scientific name for a taxid"""
+        try:
+            return self.ncbi.get_taxid_translator([taxid])[taxid]
+        except Exception as e:
+            logger.error(f"Error getting name for taxid {taxid}: {e}")
+            return "unknown"
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> 'HGTDetect':
+        """Create HGTDetect instance from command line arguments"""
+        params = HGTParameters(
+            bitscore_parameter=args.bitscore_parameter,
+            hgt_index=args.HGTIndex,
+            out_pct=args.out_pct,
+            ai_threshold=args.AI,
+            tax_level=args.tax_level,
+            search_method=args.search,
+            query_taxid=args.query_tax
+        )
+        return cls(params)
+
+    def _extract_top_hits(self, gene_results: pd.DataFrame, 
+                        taxonomy_info: Dict[str, TaxonomyInfo], 
+                        n: int = 5) -> Dict[str, List[Dict[str, Any]]]:
+        """Extract top hits from both recipient and outgroup taxa
+        
+        Args:
+            gene_results: DataFrame with DIAMOND results
+            taxonomy_info: Dictionary with taxonomy information
+            n: Number of top hits to extract
+            
+        Returns:
+            Dictionary with recipient and outgroup top hits
+        """
+        try:
+            # Split hits based on taxonomy
+            is_recipient = gene_results[6].str.split(';').str[-1].apply(
+                lambda x: self._is_recipient_taxid(str(x).strip(), taxonomy_info)
+            )
+            recipient_hits = gene_results[is_recipient]
+            outgroup_hits = gene_results[~is_recipient]
+            
+            # Sort by bitscore (column 3) in descending order
+            recipient_hits = recipient_hits.sort_values(by=3, ascending=False).head(n)
+            outgroup_hits = outgroup_hits.sort_values(by=3, ascending=False).head(n)
+            
+            # Format hits with more readable information
+            formatted_recipient = []
+            formatted_outgroup = []
+            
+            for _, hit in recipient_hits.iterrows():
+                taxid = hit[6].split(';')[-1]
+                tax_info = taxonomy_info.get(taxid)
+                species = "Unknown"
+                if tax_info:
+                    if 'species' in tax_info.alignment:
+                        species_taxid = tax_info.alignment['species']
+                        species_info = taxonomy_info.get(str(species_taxid))
+                        if species_info:
+                            species = species_info.name
+                
+                formatted_recipient.append({
+                    'subject_id': hit[1],
+                    'evalue': hit[2],
+                    'bitscore': hit[3],
+                    'taxid': taxid,
+                    'species': species
+                })
+            
+            for _, hit in outgroup_hits.iterrows():
+                taxid = hit[6].split(';')[-1]
+                tax_info = taxonomy_info.get(taxid)
+                species = "Unknown"
+                if tax_info:
+                    if 'species' in tax_info.alignment:
+                        species_taxid = tax_info.alignment['species']
+                        species_info = taxonomy_info.get(str(species_taxid))
+                        if species_info:
+                            species = species_info.name
+                
+                formatted_outgroup.append({
+                    'subject_id': hit[1],
+                    'evalue': hit[2],
+                    'bitscore': hit[3],
+                    'taxid': taxid,
+                    'species': species
+                })
+            
+            return {
+                'recipient': formatted_recipient,
+                'outgroup': formatted_outgroup
+            }
+            
+        except Exception as e:
+            logger.error(f"Error extracting top hits: {e}")
+            return {'recipient': [], 'outgroup': []}
