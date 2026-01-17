@@ -16,6 +16,6 @@ At its basic level all that is needed to use FlexiHGT is a proteome fasta file, 
 flexihgt input.fasta -q 12344 -db path/to/db/file
 '''
 
-The following will use default parameters for the taxonomic level of interest - 'family' , hgt index - 0.5, bitscore parameter - 100 and out_pct - 0.8. Thus, hits that do not share the same family taxonomy as the query proteins will be defined as being in the 'outgroup'. There are several difference
+The following will use default parameters for the taxonomic level of interest - 'family' , hgt index - 0.5, bitscore parameter - 100 and out_pct - 0.8. Thus, hits that do not share the same family taxonomy as the query proteins will be defined as being in the 'outgroup'.
 
-FlexiHGT allows for the selection of the taxonomic levels of interest by the user, with this being used to define what is an in group (within the taxonomic level) and outgroup (outside of the taxonomic level), without any knowledge of the 
+FlexiHGT allows for the selection of the taxonomic levels of interest by the user, with this being used to define what is an in group (within the taxonomic level) and outgroup (outside of the taxonomic level).
