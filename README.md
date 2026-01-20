@@ -10,10 +10,10 @@ It is advised to make an anaconda environment with python version 3.12. Diamond 
 
 *Usage instructions*
 
-At its basic level all that is needed to use FlexiHGT is a proteome fasta file, the species NCBI taxid corresponding to your proteome fasta file (organism the proteins come from) and the path to the database of your search option of choice. An example of this is shown below:
+At its basic level all that is needed to use FlexiHGT is a proteome or genome fasta file, the species NCBI taxid corresponding to your proteome/genome fasta file (organism the proteins/genes come from) and the path to the database of your search option of choice. If genomic data is being used then an MMSeqs2 database is needed, whereas for a proteome file a DIAMOND database is needed. An example of this is shown below:
 
 '''
-flexihgt input.fasta -q 12344 -db path/to/db/file
+flexihgt input.fasta -q 12344 -db path/to/db/file -s diamond
 '''
 
 The following will use default parameters for the taxonomic level of interest - 'family' , hgt index - 0.5, bitscore parameter - 100 and out_pct - 0.8. Thus, hits that do not share the same family taxonomy as the query proteins will be defined as being in the 'outgroup'.
