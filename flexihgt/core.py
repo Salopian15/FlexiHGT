@@ -746,3 +746,4 @@ class HGTDetect:
         except Exception as e:
             logger.error(f"Error extracting top hits: {e}")
             return {'recipient': [], 'outgroup': []}
+
