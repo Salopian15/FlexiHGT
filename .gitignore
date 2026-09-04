@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+venv/
+.venv/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# FlexiHGT run artefacts
+*.hits.tsv
+*.hits.tsv.meta.json
+*.annotated.parquet
+*.annotated.json
+*.params.json
+combined_query.faa*
+run_summary.tsv
+*_HGT.tsv
+*_top_hits.tsv
+taxonomy_info.csv
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

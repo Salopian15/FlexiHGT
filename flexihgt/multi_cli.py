@@ -1,4 +1,8 @@
-"""FlexiHGT command line interface."""
+"""Command line interface for multi-genome runs (``flexihgt-multi``).
+
+A separate entry point from ``flexihgt``: the single-genome command and its
+behaviour are untouched.
+"""
 
 from __future__ import annotations
 
@@ -10,38 +14,43 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import __version__
+from .cli import EXIT_FAILED, EXIT_OK, EXIT_PARTIAL, EXIT_USAGE
 from .config import ConfigError, apply_config, load_config
-from .core import ENGINES, HGTDetect, HGTParameters
+from .core import ENGINES, HGTParameters
+from .core import select_engine
+from .manifest import (
+    ManifestError,
+    build_manifest,
+    iter_protein_ids,
+    read_manifest,
+    select_genomes,
+)
+from .multi import MultiGenomeDetect
 from .search import SearchError, SearchTuning, check_database_taxonomy, resolve_database
 from .taxonomy import TAX_RANKS, get_provider
 from .utils import check_environment
 
-logger = logging.getLogger('flexihgt')
-
-# Exit codes, so a wrapper script can tell the failure modes apart.
-# 2 matches argparse's own usage-error code, so bad input always exits 2.
-EXIT_OK = 0
-EXIT_USAGE = 2
-EXIT_FAILED = 3
-EXIT_PARTIAL = 4
+logger = logging.getLogger('flexihgt.multi')
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog='flexihgt',
-        description='Detect horizontal gene transfer candidates in a proteome.',
+        prog='flexihgt-multi',
+        description=(
+            'Detect horizontal gene transfer across many proteomes from a single '
+            'combined search.'
+        ),
         epilog='Author: Jack A. Crosby, Aberystwyth University/Queens University Belfast',
     )
-    parser.add_argument('input_file', nargs='?', help='Input FASTA file of protein sequences')
-    parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
-
     parser.add_argument(
-        '-q', '--query_tax', type=int,
-        help='NCBI taxid of the organism the query sequences come from (required unless --update-only)',
+        'manifest',
+        help='TSV/CSV listing the genomes: columns taxid and fasta, optionally genome_id. '
+             'With --make-manifest, the directory of proteomes to scan instead',
     )
+    parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     parser.add_argument(
         '-db', '--database',
-        help='Path to the search database (DIAMOND .dmnd file, or MMseqs2 database prefix)',
+        help='Path to the search database (required unless --rescore-only)',
     )
 
     scoring = parser.add_argument_group('scoring thresholds')
@@ -55,7 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help='Minimum Alien Index (default: %(default)s)')
     scoring.add_argument('-t', '--tax_level', default='family', choices=list(TAX_RANKS),
                          metavar='RANK',
-                         help='Rank separating in-group from out-group (default: %(default)s)')
+                         help='Rank separating in-group from out-group, applied per '
+                              'genome (default: %(default)s)')
 
     search = parser.add_argument_group('search')
     search.add_argument('-s', '--search', default='diamond',
@@ -68,98 +78,98 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument('--threads', type=int, default=0,
                         help='Threads for the search tool (default: all available)')
     search.add_argument('--block_size', type=float, default=0,
-                        help='DIAMOND -b. Main throughput lever; needs roughly '
-                             '6x this value in GB of RAM (default: DIAMOND\'s own)')
+                        help='DIAMOND -b. Needs roughly 6x this value in GB of RAM')
     search.add_argument('--index_chunks', type=int, default=0,
                         help='DIAMOND -c. Fewer chunks means fewer passes over the database')
     search.add_argument('--memory_limit', metavar='SIZE',
                         help="MMseqs2 --split-memory-limit, e.g. '64G'")
-    search.add_argument('--tmpdir', metavar='PATH',
-                        help='Scratch directory; point at local NVMe if the working '
-                             'directory is on a network filesystem')
+    search.add_argument('--tmpdir', metavar='PATH', help='Scratch directory for the search')
     search.add_argument('--force', action='store_true',
-                        help='Re-run the search even if matching results already exist')
+                        help='Rebuild the combined FASTA and re-run the search')
     search.add_argument('--rescore-only', action='store_true',
-                        help='Skip the search and rescore existing <input>.hits.tsv, '
-                             'for trying different thresholds')
+                        help='Skip the search and rescore the existing combined hit table')
     search.add_argument('--engine', default='auto', choices=list(ENGINES),
                         help='Scoring engine: pandas loads the hit table into memory, '
                              'duckdb streams it from disk (default: %(default)s, which '
                              'picks duckdb for tables over 2 GB)')
 
     output = parser.add_argument_group('output')
-    output.add_argument('-o', '--outfile',
-                        help='Results TSV (default: <input>_<tax_level>_HGT.tsv). '
-                             'Top hits are written alongside it as <name>_top_hits.tsv')
+    output.add_argument('-o', '--outdir', default='flexihgt_multi',
+                        help='Output directory (default: %(default)s)')
+    output.add_argument('--work-dir', metavar='PATH',
+                        help='Where the combined FASTA and hit table live '
+                             '(default: <outdir>/work)')
+    output.add_argument('--no-per-genome', action='store_true',
+                        help='Write only the combined table, not one file per genome')
     output.add_argument('--top_hits', type=int, default=5,
-                        help='Hits per side to record in the top-hits file (default: %(default)s)')
+                        help='Hits per side recorded per candidate (default: %(default)s)')
     output.add_argument('--taxonomy_dump', metavar='PATH',
                         help='Also write the resolved taxonomy to this TSV (for debugging)')
-    output.add_argument('-v', '--verbose', action='store_true', help='Enable debug logging')
+    output.add_argument('--resume', action='store_true',
+                        help='Skip genomes whose results already exist, so an '
+                             'interrupted run can be restarted')
 
-    output.add_argument('--no-cache', action='store_true',
-                        help='Do not read or write the annotated-hits cache')
-
+    parser.add_argument('--genomes', metavar='IDS',
+                        help='Restrict to these genome ids: a comma-separated list or a '
+                             'file with one id per line. Useful for job arrays')
     parser.add_argument('--taxonomy-backend', default='ete3', choices=['ete3', 'taxopy'],
-                        help='Taxonomy source (default: %(default)s). taxopy keeps '
-                             'nodes.dmp/names.dmp in memory and is faster, but must '
-                             'be installed separately')
+                        help='Taxonomy source (default: %(default)s)')
     parser.add_argument('--taxonomy-dir', metavar='PATH',
                         help='Directory holding nodes.dmp/names.dmp, for --taxonomy-backend taxopy')
-    parser.add_argument('-u', '--update', action='store_true',
-                        help='Update the local NCBI taxonomy database before running')
-    parser.add_argument('--update-only', action='store_true',
-                        help='Update the local NCBI taxonomy database and exit')
-    parser.add_argument('--skip-checks', action='store_true',
-                        help='Skip the dependency/environment checks, including the '
-                             'pre-flight test that the database carries taxonomy')
+    manifest_group = parser.add_argument_group('manifest building')
+    manifest_group.add_argument('--make-manifest', metavar='PATH',
+                                help='Scan the given directory of proteomes, write a '
+                                     'manifest to this path, and exit')
+    manifest_group.add_argument('--taxid-map', metavar='PATH',
+                                help='TSV of "id<TAB>taxid" overrides for --make-manifest, '
+                                     'for proteomes whose taxid cannot be inferred')
+
     parser.add_argument('--config', metavar='PATH',
                         help='TOML or JSON file of options. Command line flags win')
     parser.add_argument('--dry-run', action='store_true',
                         help='Report what the run would do, then stop')
+    parser.add_argument('--skip-checks', action='store_true',
+                        help='Skip the dependency/environment checks, including the '
+                             'pre-flight test that the database carries taxonomy')
+    parser.add_argument('--log-level', default='INFO',
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                        help='Logging verbosity. Use WARNING for very large runs, where '
+                             'one line per candidate is too much (default: %(default)s)')
     return parser
 
 
-def _update_taxonomy() -> None:
-    """Refresh the local ete3 taxonomy database."""
-    # The old call (``ete3.ncbi.update_taxonomy_database()``) referenced a
-    # module attribute that does not exist; the update is a method on an
-    # NCBITaxa instance.
-    from .taxonomy import Ete3Taxonomy
+def _report_plan(records, db_path, params, args) -> None:
+    """Describe what a multi-genome run would do, without doing it."""
+    work_dir = Path(args.work_dir) if args.work_dir else Path(args.outdir) / 'work'
+    hits_path = work_dir / 'combined_query.hits.tsv'
+    proteins = 0
+    for record in records:
+        proteins += sum(1 for _ in iter_protein_ids(record))
 
-    logger.info('Updating the NCBI taxonomy database (this downloads ~100 MB)...')
-    Ete3Taxonomy().update_database()
-    logger.info('Taxonomy database update complete')
-
-
-def _report_plan(input_path: Path, db_path, params, args) -> None:
-    """Describe what a run would do, without doing it.
-
-    Worth a few seconds before committing a machine to a long job.
-    """
-    from .core import select_engine
-
-    genes = sum(1 for _ in HGTDetect.read_fasta_ids(input_path))
-    hits_path = input_path.with_suffix('.hits.tsv')
     logger.info('--- plan ---')
-    logger.info('Input:      %s (%d sequences)', input_path, genes)
+    logger.info('Genomes:    %d', len(records))
+    logger.info('Proteins:   %d', proteins)
     logger.info('Database:   %s', db_path)
     logger.info('Thresholds: bitscore>=%s, HGT index>=%s, out_pct>=%s, AI>=%s at %s level',
                 params.bitscore_parameter, params.hgt_index, params.out_pct,
                 params.ai_threshold, params.tax_level)
     if hits_path.exists():
         size = hits_path.stat().st_size
-        logger.info('Search:     reuse %s (%.1f MB) if its settings match, else re-run',
-                    hits_path, size / 1e6)
+        logger.info('Search:     reuse %s (%.2f GB) if its settings match',
+                    hits_path, size / 1024 ** 3)
         logger.info('Engine:     %s', select_engine(args.engine, hits_path))
     else:
-        estimate = genes * params.max_hits * 60 / 1e9
+        estimate = proteins * params.max_hits * 60 / 1024 ** 3
         logger.info('Search:     will run; hit table roughly %.1f GB '
-                    '(%d genes x %d hits)', estimate, genes, params.max_hits)
-        logger.info('Engine:     %s (auto picks duckdb over 2 GB)', args.engine)
-    cache, _ = HGTDetect.annotation_cache_paths(hits_path)
-    logger.info('Annotation: %s', 'cached' if cache.exists() else 'will be computed')
-    logger.info('Output:     %s', args.outfile or f'{input_path.stem}_{params.tax_level}_HGT.tsv')
+                    '(%d proteins x %d hits)', estimate, proteins, params.max_hits)
+        logger.info('Engine:     %s%s', args.engine,
+                    ' (duckdb once over 2 GB)' if args.engine == 'auto' else '')
+    if args.resume:
+        genome_dir = Path(args.outdir) / 'genomes'
+        done = len(list(genome_dir.glob('*_HGT.tsv'))) if genome_dir.is_dir() else 0
+        logger.info('Resume:     %d genome(s) already scored, %d to do',
+                    done, max(0, len(records) - done))
+    logger.info('Output:     %s', Path(args.outdir).resolve())
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -175,40 +185,31 @@ def main(argv: Optional[List[str]] = None) -> int:
             return EXIT_USAGE
 
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=getattr(logging, args.log_level),
         format='%(asctime)s - %(levelname)s - %(message)s',
     )
 
     try:
-        if args.update or args.update_only:
-            if args.taxonomy_backend != 'ete3':
-                # Updating ete3's database when the run will not use it looks
-                # like success and changes nothing that matters.
-                logger.error(
-                    '--update only applies to the ete3 backend; taxopy reads '
-                    'nodes.dmp/names.dmp directly, so download them from '
-                    'https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/ instead.'
-                )
-                return EXIT_USAGE
+        if args.make_manifest:
             try:
-                _update_taxonomy()
-            except Exception as exc:  # noqa: BLE001 - reported to the user
-                logger.error('Failed to update the taxonomy database: %s', exc, exc_info=args.verbose)
-                return EXIT_FAILED
-            if args.update_only:
-                return EXIT_OK
+                records, unresolved = build_manifest(
+                    Path(args.manifest), Path(args.make_manifest),
+                    Path(args.taxid_map) if args.taxid_map else None,
+                )
+            except ManifestError as exc:
+                logger.error('%s', exc)
+                return EXIT_USAGE
+            logger.info('Wrote %d genome(s) to %s', len(records), args.make_manifest)
+            return EXIT_PARTIAL if unresolved else EXIT_OK
 
-        if not args.input_file:
-            parser.error('input_file is required (unless --update-only is given)')
-        if args.query_tax is None:
-            parser.error('-q/--query_tax is required')
+        try:
+            records = select_genomes(read_manifest(Path(args.manifest)), args.genomes)
+        except ManifestError as exc:
+            logger.error('%s', exc)
+            return EXIT_USAGE
+
         if not args.database and not args.rescore_only:
             parser.error('-db/--database is required (unless --rescore-only is given)')
-
-        input_path = Path(args.input_file)
-        if not input_path.is_file():
-            logger.error('Invalid input file: %s', input_path)
-            return EXIT_USAGE
 
         try:
             params = HGTParameters(
@@ -218,7 +219,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ai_threshold=args.AI,
                 tax_level=args.tax_level,
                 search_method=args.search,
-                query_taxid=args.query_tax,
+                query_taxid=None,          # supplied per genome by the manifest
                 max_hits=args.max_hits,
                 evalue=args.evalue,
                 threads=args.threads,
@@ -228,9 +229,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             logger.error('Invalid parameters: %s', exc)
             return EXIT_USAGE
 
-        # The search tools are irrelevant when only rescoring cached hits.
         if not args.skip_checks and not check_environment(
-            params.search_method, input_path,
+            params.search_method, records[0].fasta,
             need_search_tool=not args.rescore_only,
             taxonomy_backend=args.taxonomy_backend,
             taxonomy_dir=args.taxonomy_dir,
@@ -253,29 +253,30 @@ def main(argv: Optional[List[str]] = None) -> int:
             return EXIT_USAGE
 
         if db_path is not None and not args.skip_checks:
-            problem = check_database_taxonomy(db_path, params.search_method, input_path)
+            problem = check_database_taxonomy(
+                db_path, params.search_method, records[0].fasta
+            )
             if problem:
-                # Failing here costs a second; failing after the search costs hours.
+                # Failing here costs a second; failing after the search of a
+                # whole manifest costs days.
                 logger.error('%s', problem)
                 return EXIT_USAGE
 
-        logger.info('FlexiHGT %s starting', __version__)
-        logger.info('Query taxid: %s', args.query_tax)
+        logger.info('FlexiHGT %s starting (multi-genome, %d genome(s))',
+                    __version__, len(records))
         logger.info('Parameters: %s', params)
 
         if args.dry_run:
-            _report_plan(input_path, db_path, params, args)
+            _report_plan(records, db_path, params, args)
             return EXIT_OK
 
         start_time = time.time()
-        detector = HGTDetect(params, taxonomy=taxonomy)
         try:
-            result = detector.run_analysis(
-                input_path,
+            result = MultiGenomeDetect(params, taxonomy=taxonomy).run(
+                records,
                 db_path,
-                output_file=Path(args.outfile) if args.outfile else None,
-                force=args.force,
-                taxonomy_dump=Path(args.taxonomy_dump) if args.taxonomy_dump else None,
+                output_dir=Path(args.outdir),
+                work_dir=Path(args.work_dir) if args.work_dir else None,
                 tuning=SearchTuning(
                     threads=args.threads,
                     block_size=args.block_size,
@@ -283,39 +284,39 @@ def main(argv: Optional[List[str]] = None) -> int:
                     tmpdir=Path(args.tmpdir) if args.tmpdir else None,
                     memory_limit=args.memory_limit,
                 ),
+                force=args.force,
                 rescore_only=args.rescore_only,
-                use_cache=not args.no_cache,
+                per_genome=not args.no_per_genome,
                 engine=args.engine,
+                resume=args.resume,
+                taxonomy_dump=Path(args.taxonomy_dump) if args.taxonomy_dump else None,
             )
         except (SearchError, FileNotFoundError, ValueError, RuntimeError) as exc:
-            logger.error('Analysis failed: %s', exc, exc_info=args.verbose)
+            logger.error('Run failed: %s', exc, exc_info=args.log_level == 'DEBUG')
             return EXIT_FAILED
         except Exception:  # noqa: BLE001 - unexpected, show the traceback
-            logger.exception('Analysis failed with an unexpected error')
+            logger.exception('Run failed with an unexpected error')
             return EXIT_FAILED
 
         elapsed = time.time() - start_time
         logger.info(
-            'Analysis complete in %dh %dm %ds',
+            'Finished in %dh %dm %ds',
             int(elapsed // 3600), int((elapsed % 3600) // 60), int(elapsed % 60),
         )
-        logger.info(
-            'Found %d potential HGT event(s) across %d gene(s) (%d had search hits)',
-            len(result), result.genes_total, result.genes_with_hits,
-        )
-        if result.genes_all_synthetic:
-            logger.info(
-                '%d gene(s) hit only synthetic constructs and could not be scored',
-                result.genes_all_synthetic,
-            )
+        logger.info('%d candidate(s) across %d genome(s); combined table: %s',
+                    result.total_candidates, len(result), result.combined_path)
 
-        if result.gene_errors:
-            # Do not report success when part of the proteome was never scored.
+        skipped = [o for o in result.outcomes if o.status == 'skipped']
+        if skipped:
+            logger.warning('%d genome(s) skipped, e.g. %s', len(skipped),
+                           '; '.join(f'{o.genome_id}: {o.note}' for o in skipped[:3]))
+        if result.failed or result.total_errors:
             logger.error(
-                '%d gene(s) failed to process, e.g. %s',
-                len(result.gene_errors),
-                '; '.join(f'{gene}: {err}' for gene, err in result.gene_errors[:3]),
+                '%d genome(s) failed and %d gene(s) errored; see %s',
+                len(result.failed), result.total_errors, result.summary_path,
             )
+            return EXIT_PARTIAL
+        if skipped:
             return EXIT_PARTIAL
         return EXIT_OK
 
