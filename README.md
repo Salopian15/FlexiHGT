@@ -12,7 +12,7 @@ phylogenetic analysis of horizontal gene transfer.* Briefings in Bioinformatics
 ## Installation
 
 Create a conda environment (Python 3.9–3.12; `ete3` does not install cleanly on
-3.13) and pull the search tools from bioconda:
+3.13from my testing) and pull the search tools from bioconda:
 
 ```bash
 conda create -n flexihgt -c bioconda -c conda-forge python=3.11 diamond mmseqs2
@@ -51,8 +51,8 @@ flexihgt input.faa -q 12344 -db path/to/db.dmnd -t phylum
 ```
 
 The rank has to be one the query organism's own lineage has. NCBI assigns ranks
-patchily — plenty of bacteria have no family, and `tribe` or `subgenus` are
-absent almost everywhere — and without an ancestor at the chosen rank nothing
+messily, plenty of bacteria have no family, and `tribe` or `subgenus` are
+absent almost everywhere. Without an ancestor at the chosen rank nothing
 could ever count as in-group, so the run stops and tells you which ranks are
 available instead of scoring the whole proteome as foreign.
 
@@ -63,16 +63,16 @@ available instead of scoring the whole proteome as foreign.
 | `diamond` (default) | DIAMOND `.dmnd` file | `diamond makedb --taxonmap … --taxonnodes …` |
 | `mmseqs` | MMseqs2 database prefix | `mmseqs createdb` then `mmseqs createtaxdb` |
 
-Both must carry taxonomy information — FlexiHGT needs a taxid per hit and drops
+Both must carry taxonomy information, FlexiHGT needs a taxid per hit and drops
 hits that do not have one.
 
 ### Output
 
 Two TSV files are written per run:
 
-- `<input>_<tax_level>_HGT.tsv` — one row per candidate, with each score, the
+- `<input>_<tax_level>_HGT.tsv` one row per candidate, with each score, the
   donor taxid and the donor's full resolved lineage. Override with `-o`.
-- `<name>_top_hits.tsv` — the best hits from each side of the split, for
+- `<name>_top_hits.tsv`, the best hits from each side of the split, for
   eyeballing individual calls.
 
 ### Caching and threshold sweeps
@@ -148,7 +148,9 @@ it with `pip install '.[taxopy]'` and point `--taxonomy-dir` at the dump files.
 ## Many genomes at once
 
 `flexihgt-multi` analyses a set of proteomes from a **single** combined search.
-It is a separate command — `flexihgt` and its behaviour are unchanged.
+It is a separate command `flexihgt` and its behaviour are unchanged.
+
+(Note this feature is untested on real data as of yet)
 
 Describe the genomes in a TSV or CSV manifest. `taxid` and `fasta` are required;
 `genome_id` defaults to the FASTA's stem, and relative paths resolve against the
@@ -197,14 +199,14 @@ command exits 4 so a script notices.
 
 Useful flags:
 
-- `--genomes` — restrict to a comma-separated list of ids or a file of ids, for
+- `--genomes` restrict to a comma-separated list of ids or a file of ids, for
   splitting one manifest across a job array.
-- `--resume` — skip genomes whose results already exist, so an interrupted run
+- `--resume`  skip genomes whose results already exist, so an interrupted run
   can be restarted.
-- `--rescore-only` — reuse the combined hit table and just re-apply thresholds.
-- `--no-per-genome` — write only the combined table.
-- `--dry-run` — report the plan and stop.
-- `--log-level WARNING` — the default logs a line per candidate, which is too
+- `--rescore-only`  reuse the combined hit table and just re-apply thresholds.
+- `--no-per-genome`  write only the combined table.
+- `--dry-run`  report the plan and stop.
+- `--log-level WARNING`  the default logs a line per candidate, which is too
   much for very large runs.
 
 A genome whose taxid cannot be resolved is skipped and recorded in the summary
